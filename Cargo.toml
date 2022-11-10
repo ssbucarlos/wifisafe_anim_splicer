@@ -1,0 +1,13 @@
+[package]
+name = "wifisafe_anim_splicer"
+version = "1.0.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ssbh_lib = { git = "https://github.com/ultimate-research/ssbh_lib", features = ["strum", "serde"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive"] }
+anyhow = "1.0"
