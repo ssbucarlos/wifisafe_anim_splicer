@@ -105,6 +105,9 @@ fn main() -> Result<()> {
     // Gather new bone data to finish the new transform group
     if let Anim::V20{groups, buffer, ..} | Anim::V21{groups, buffer, ..} = &modified_anim{
         for modified_group in &groups.elements{
+            if modified_group.group_type != GroupType::Transform{
+                continue;
+            }
             for modified_node in &modified_group.nodes.elements{
                 if reference_node_names.contains(&modified_node.name){
                     continue;
