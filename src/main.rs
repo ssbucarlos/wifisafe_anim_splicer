@@ -1,33 +1,40 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ssbh_lib::{formats::anim::GroupType, prelude::*, SsbhArray, SsbhByteBuffer};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
 struct Args {
-    #[arg(short, long)]
-    reference_anim: std::path::PathBuf,
-    #[arg(short, long)]
-    modified_anim: std::path::PathBuf,
-    #[arg(short, long)]
-    output_path: std::path::PathBuf,
+    #[arg(short = 'r', long)]
+    reference_anim_file: Option<PathBuf>,
+    #[arg(short = 'm', long)]
+    modified_anim_file: Option<PathBuf>,
+    #[arg(short = 'o', long)]
+    output_file: Option<PathBuf>,
+    #[arg(long = "reference_folder")]
+    batch_reference_folder: Option<PathBuf>,
+    #[arg(long = "modified_folder")]
+    batch_modified_folder: Option<PathBuf>,
+    #[arg(long = "output_folder")]
+    batch_output_folder: Option<PathBuf>,
 }
-fn main() -> Result<()> {
-    let start_time = Instant::now();
-    let args = Args::parse();
-    let reference_anim = ssbh_lib::formats::anim::Anim::from_file(&args.reference_anim)
-        .with_context(|| {
+
+fn splice_anim(reference_anim: &PathBuf, modified_anim: &PathBuf) -> Result<Anim> {
+    let reference_anim =
+        ssbh_lib::formats::anim::Anim::from_file(reference_anim).with_context(|| {
             format!(
                 "coult not read reference anim `{}`",
-                &args.reference_anim.display()
+                &reference_anim.display()
             )
         })?;
-    let modified_anim = ssbh_lib::formats::anim::Anim::from_file(&args.modified_anim)
-        .with_context(|| {
+    let modified_anim =
+        ssbh_lib::formats::anim::Anim::from_file(modified_anim).with_context(|| {
             format!(
                 "coult not read modified anim `{}`",
-                &args.modified_anim.display()
+                &modified_anim.display()
             )
         })?;
 
@@ -214,7 +221,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let new_anim = match reference_anim {
+    match reference_anim {
         Anim::V20 {
             final_frame_index,
             unk1,
@@ -229,6 +236,7 @@ fn main() -> Result<()> {
             groups: new_groups,
             buffer: new_buffer,
         }),
+
         Anim::V21 {
             final_frame_index,
             unk1,
@@ -245,20 +253,140 @@ fn main() -> Result<()> {
             buffer: new_buffer,
             unk_data,
         }),
+
         _ => Err(anyhow::format_err!(
             "Got an unsupported reference anim but this code should have never been reached "
         )),
-    };
+    }
+}
 
-    new_anim?
-        .write_to_file(&args.output_path)
-        .with_context(|| {
+fn do_batch_mode(
+    batch_reference_dir: &PathBuf,
+    batch_modified_dir: &PathBuf,
+    batch_output_dir: &Path,
+) -> Result<()> {
+    let reference_anim_paths = fs::read_dir(batch_reference_dir)
+        .unwrap()
+        .filter_map(|dir_entry| dir_entry.ok())
+        .map(|dir_entry| dir_entry.path())
+        .filter(|path| path.extension().unwrap().eq("nuanmb"))
+        .collect::<Vec<_>>();
+
+    let modified_anim_paths = fs::read_dir(batch_modified_dir)
+        .unwrap()
+        .filter_map(|dir_entry| dir_entry.ok())
+        .map(|dir_entry| dir_entry.path())
+        .filter(|path| path.extension().unwrap().eq("nuanmb"))
+        .collect::<Vec<_>>();
+
+    for modified_anim_path in modified_anim_paths {
+        let matching_vanilla_anim_path: PathBuf = match reference_anim_paths
+            .iter()
+            .find(|&p| p.file_name() == modified_anim_path.file_name())
+        {
+            Some(path) => path.clone(),
+            None => {
+                println!(
+                    "Skipping modified file {modified_anim_path:?}, no vanilla anim was found!"
+                );
+                continue;
+            }
+        };
+
+        let new_anim: Anim = match splice_anim(&matching_vanilla_anim_path, &modified_anim_path) {
+            Ok(anim) => anim,
+            Err(e) => {
+                println!("An error {e} happened splicing {modified_anim_path:?} with {matching_vanilla_anim_path:?}, so no spliced anim will be outputted.");
+                continue;
+            }
+        };
+
+        let output_file_path = batch_output_dir.join(modified_anim_path.file_name().unwrap());
+        new_anim.write_to_file(&output_file_path).with_context(|| {
             format!(
                 "could not output the new anim to the output path `{}`",
-                &args.output_path.display()
+                &output_file_path.display()
             )
         })?;
-
-    println!("Done! elapsed time = {:?}!", start_time.elapsed());
+    }
     Ok(())
+}
+
+fn do_single_mode(
+    reference_anim: &PathBuf,
+    modified_anim: &PathBuf,
+    output_anim: &PathBuf,
+) -> Result<()> {
+    let new_anim = splice_anim(reference_anim, modified_anim);
+    new_anim?.write_to_file(output_anim).with_context(|| {
+        format!(
+            "could not output the new anim to the output path `{}`",
+            &output_anim.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(PartialEq)]
+enum Mode {
+    Single,
+    Batch,
+    None,
+}
+
+fn get_mode(args: &Args) -> Mode {
+    if args.batch_reference_folder.is_some()
+        || args.batch_modified_folder.is_some()
+        || args.batch_output_folder.is_some()
+    {
+        Mode::Batch
+    } else if args.reference_anim_file.is_some()
+        || args.modified_anim_file.is_some()
+        || args.output_file.is_some()
+    {
+        Mode::Single
+    } else {
+        Mode::None
+    }
+}
+fn main() -> Result<()> {
+    let start_time = Instant::now();
+
+    let args = Args::parse();
+
+    let mode = get_mode(&args);
+
+    let result = match mode {
+        Mode::Batch => {
+            let batch_reference_dir = args
+                .batch_reference_folder
+                .expect("Batch mode specified, but the reference folder was not given!");
+            let batch_modified_dir = args
+                .batch_modified_folder
+                .expect("Batch mode specified, but modified folder is missing!");
+            let batch_output_dir = args
+                .batch_output_folder
+                .expect("Batch mode specified, but the output folder is missing!");
+            do_batch_mode(&batch_reference_dir, &batch_modified_dir, &batch_output_dir)
+        }
+        Mode::Single => {
+            let reference_anim_path = args
+                .reference_anim_file
+                .expect("Batch mode was not specified, but a reference anim was not given!");
+            let modified_anim_path = args
+                .modified_anim_file
+                .expect("Batch mode was not specified, but a modified anim was not given!");
+            let output_file_path = args
+                .output_file
+                .expect("Batch mode was not specified, but the output file path was not provided!");
+            do_single_mode(&reference_anim_path, &modified_anim_path, &output_file_path)
+        }
+        Mode::None => Err(anyhow::format_err!(
+            "No arguments passed in! Please run with -h or --help for help."
+        )),
+    };
+    if mode != Mode::None {
+        println!("Done! elapsed time = {:?}!", start_time.elapsed());
+    }
+    result
 }
