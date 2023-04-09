@@ -16,9 +16,14 @@ The SSBU `.nuanmb` file format uses lossy compression, as such importing a `.nua
 * Grab the .exe from the 'Releases' page
 * Run it from the command line (don't double click the .exe)
 * Use -h or --help to see the parameters needed to run it properly.
-* Example usage 
-
-   `wifisafe_anim_splicer.exe -r vanilla_palu_ftillt.nuanmb -m modified_palu_ftilt.nuanmb -o output.nuanmb`
+#### Example usage 
+* `wifisafe_anim_splicer.exe -r vanilla_palu_ftillt.nuanmb -m modified_palu_ftilt.nuanmb -o output.nuanmb`
+#### Example usage (Batch Mode)
+* If the folders are layed out like this-
+* ![image](https://user-images.githubusercontent.com/77519735/230791951-8129a147-5d58-4d76-871f-c7d55412156d.png)
+* Then the command looks like this
+* `wifisafe_anim_splicer.exe --reference_folder "vanilla_anims" --modified_folder "modded_anims" --output_folder "output_folder"`
+   
 * Verify the resulting `.nuanmb` is wifi-safe by grabbing [ssbh_data_json](https://github.com/ultimate-research/ssbh_lib/releases) and comparing the new .nuanmb's JSON vs the reference's JSON.
 
    If its wifi-safe, there should be no difference in the Transform data for the vanilla bones.
