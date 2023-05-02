@@ -26,14 +26,14 @@ fn splice_anim(reference_anim: &PathBuf, modified_anim: &PathBuf) -> Result<Anim
     let reference_anim =
         ssbh_lib::formats::anim::Anim::from_file(reference_anim).with_context(|| {
             format!(
-                "coult not read reference anim `{}`",
+                "could not read reference anim `{}`",
                 &reference_anim.display()
             )
         })?;
     let modified_anim =
         ssbh_lib::formats::anim::Anim::from_file(modified_anim).with_context(|| {
             format!(
-                "coult not read modified anim `{}`",
+                "could not read modified anim `{}`",
                 &modified_anim.display()
             )
         })?;
