@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use ssbh_lib::{formats::anim::GroupType, prelude::*, SsbhArray, SsbhByteBuffer};
+use itertools::Itertools;
+use ssbh_lib::formats::anim::{Group, GroupType, Node, TrackV2};
+use ssbh_lib::{prelude::*, SsbhArray, SsbhByteBuffer};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -22,6 +24,61 @@ struct Args {
     batch_output_folder: Option<PathBuf>,
 }
 
+#[derive(Clone)]
+struct AnimTransformNodeData {
+    name: String,
+    buffer: Vec<u8>,
+    track: TrackV2,
+}
+
+impl AnimTransformNodeData {
+    pub fn from(node: &Node, buffer: &SsbhByteBuffer) -> Self {
+        let track = &node.tracks.elements[0];
+        let start_index = track.data_offset as usize;
+        let end_index = (track.data_offset as u64 + track.data_size) as usize;
+        let buffer_slice = &buffer.elements[start_index..end_index];
+        Self {
+            name: String::from(node.name.to_str().unwrap()),
+            buffer: buffer_slice.to_vec(),
+            track: track.clone(),
+        }
+    }
+}
+
+struct AnimGroupWithBuffer<'a> {
+    group: &'a Group,
+    buffer: &'a SsbhByteBuffer,
+}
+
+fn get_anim_group_and_buffer_with_fallback<'a>(
+    priority_groups: &'a SsbhArray<Group>,
+    priority_buffer: &'a SsbhByteBuffer,
+    fallback_groups: &'a SsbhArray<Group>,
+    fallback_buffer: &'a SsbhByteBuffer,
+    group_type: GroupType,
+) -> Option<AnimGroupWithBuffer<'a>> {
+    let priority_group = priority_groups
+        .elements
+        .iter()
+        .find(|group_entry| group_entry.group_type == group_type);
+
+    let fallback_group = fallback_groups
+        .elements
+        .iter()
+        .find(|group_entry| group_entry.group_type == group_type);
+
+    match priority_group {
+        Some(priority_group) => Some(AnimGroupWithBuffer {
+            group: priority_group,
+            buffer: priority_buffer,
+        }),
+        None => fallback_group.map(|fallback_group| AnimGroupWithBuffer {
+            group: fallback_group,
+            buffer: fallback_buffer,
+        }),
+    }
+}
+
 fn splice_anim(reference_anim: &PathBuf, modified_anim: &PathBuf) -> Result<Anim> {
     let reference_anim =
         ssbh_lib::formats::anim::Anim::from_file(reference_anim).with_context(|| {
@@ -30,6 +87,7 @@ fn splice_anim(reference_anim: &PathBuf, modified_anim: &PathBuf) -> Result<Anim
                 &reference_anim.display()
             )
         })?;
+
     let modified_anim =
         ssbh_lib::formats::anim::Anim::from_file(modified_anim).with_context(|| {
             format!(
@@ -38,187 +96,135 @@ fn splice_anim(reference_anim: &PathBuf, modified_anim: &PathBuf) -> Result<Anim
             )
         })?;
 
-    // Validate Anim Versions
-    if let Anim::V12 { .. } = &reference_anim {
-        return Err(anyhow::format_err!("v12 reference anim not supported!"));
-    }
-    if let Anim::V12 { .. } = &modified_anim {
-        return Err(anyhow::format_err!("v12 modified anim not supported!"));
-    }
-
-    // Gather reference data
-    let mut reference_node_name_to_buffer = std::collections::HashMap::new();
-    let mut reference_node_name_to_track = std::collections::HashMap::new();
-    let mut reference_node_names = Vec::new();
-    if let Anim::V21 { groups, buffer, .. } | Anim::V20 { groups, buffer, .. } = &reference_anim {
-        for group in &groups.elements {
-            if group.group_type != GroupType::Transform {
-                continue;
-            }
-            for node in &group.nodes.elements {
-                let track = &node.tracks.elements[0];
-                let node_name = String::from(node.name.to_str().unwrap());
-                let start_index = track.data_offset as usize;
-                let end_index = (track.data_offset as u64 + track.data_size) as usize;
-                let buffer_slice = &buffer.elements[start_index..end_index];
-                reference_node_name_to_buffer.insert(node_name.clone(), buffer_slice);
-                reference_node_name_to_track.insert(node_name.clone(), track);
-                reference_node_names.push(node.name.clone());
-            }
+    let (reference_groups, reference_buffer) = match &reference_anim {
+        Anim::V20 { groups, buffer, .. } | Anim::V21 { groups, buffer, .. } => (groups, buffer),
+        Anim::V12 { .. } => {
+            return Err(anyhow::format_err!("v12 reference anim not supported!"));
         }
-    }
+    };
 
-    // Find out and keep track which groups exist in the modified animation
-    // A user may provide only the vis track for instance, but the expected
-    // result is that the existing transform and mat tracks would remain in
-    // the spliced anim.
-    let mut modified_group_types: Vec<GroupType> = Vec::new();
-    if let Anim::V21 { groups, .. } | Anim::V20 { groups, .. } = &modified_anim {
-        for group in &groups.elements {
-            modified_group_types.push(group.group_type);
+    let (modified_groups, modified_buffer) = match &modified_anim {
+        Anim::V20 { groups, buffer, .. } | Anim::V21 { groups, buffer, .. } => (groups, buffer),
+        Anim::V12 { .. } => {
+            return Err(anyhow::format_err!("v12 modified anim not supported!"));
         }
-    }
+    };
 
-    // Now format the new buffer
+    let reference_transform_group = reference_groups
+        .elements
+        .iter()
+        .find(|group_entry| group_entry.group_type == GroupType::Transform);
+
+    let reference_transform_nodes_data: Vec<AnimTransformNodeData> = match reference_transform_group
+    {
+        Some(group) => group
+            .nodes
+            .elements
+            .iter()
+            .map(|node| AnimTransformNodeData::from(node, reference_buffer))
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let modified_transform_group = modified_groups
+        .elements
+        .iter()
+        .find(|group_entry| group_entry.group_type == GroupType::Transform);
+
+    // Basically the transform data of added bones in the new anim ONLY.
+    let modified_exclusive_transform_nodes_data: Vec<AnimTransformNodeData> =
+        match modified_transform_group {
+            Some(group) => group
+                .nodes
+                .elements
+                .iter()
+                .filter(|mod_node| {
+                    !reference_transform_nodes_data
+                        .iter()
+                        .any(|ref_node| mod_node.name.to_string_lossy() == ref_node.name)
+                })
+                .map(|mod_node| AnimTransformNodeData::from(mod_node, modified_buffer))
+                .collect(),
+            None => Vec::new(),
+        };
+
+    let spliced_transform_nodes_data: Vec<AnimTransformNodeData> = reference_transform_nodes_data
+        .iter()
+        .cloned()
+        .chain(modified_exclusive_transform_nodes_data.iter().cloned())
+        .sorted_by_key(|x| x.name.to_lowercase())
+        .collect::<Vec<_>>();
+
     let mut current_offset: u64 = 0;
     let mut new_buffer = SsbhByteBuffer::new();
     let mut new_groups: SsbhArray<ssbh_lib::formats::anim::Group> = SsbhArray::new();
-    // First just go through the vanilla anim's bone data and just copy all those buffers as-is.
-    // Then we can just grab any new bone data and the vis/mat tracks from the modified anim
-    let mut new_transform_group = ssbh_lib::formats::anim::Group {
-        group_type: ssbh_lib::formats::anim::GroupType::Transform,
-        nodes: SsbhArray::new(),
-    };
-    if let Anim::V20 { groups, .. } | Anim::V21 { groups, .. } = &reference_anim {
-        for reference_group in &groups.elements {
-            if reference_group.group_type != GroupType::Transform {
-                continue;
-            }
-            for reference_node in &reference_group.nodes.elements {
-                let mut new_node = ssbh_lib::formats::anim::Node {
-                    name: reference_node.name.clone(),
-                    tracks: SsbhArray::new(),
-                };
-                for reference_track in &reference_node.tracks.elements {
-                    let new_track = ssbh_lib::formats::anim::TrackV2 {
-                        data_offset: current_offset as u32,
-                        ..reference_track.clone()
-                    };
-                    let reference_buffer = reference_node_name_to_buffer
-                        .get(reference_node.name.to_str().unwrap())
-                        .unwrap();
-                    new_buffer.elements.extend_from_slice(reference_buffer);
-                    current_offset += reference_track.data_size;
-                    new_node.tracks.elements.push(new_track);
-                }
-                new_transform_group.nodes.elements.push(new_node);
-            }
-        }
-    }
 
-    // At this point, only one transform group has been made.
-    // Gather new bone data to finish the new transform group
-    if let Anim::V20 { groups, buffer, .. } | Anim::V21 { groups, buffer, .. } = &modified_anim {
-        for modified_group in &groups.elements {
-            if modified_group.group_type != GroupType::Transform {
-                continue;
-            }
-            for modified_node in &modified_group.nodes.elements {
-                if reference_node_names.contains(&modified_node.name) {
-                    continue;
-                }
-                let mut new_node = ssbh_lib::formats::anim::Node {
-                    name: modified_node.name.clone(),
-                    tracks: SsbhArray::new(),
-                };
-                for modified_track in &modified_node.tracks.elements {
-                    let new_track = ssbh_lib::formats::anim::TrackV2 {
-                        data_offset: current_offset as u32,
-                        ..modified_track.clone()
-                    };
-                    let start_index = modified_track.data_offset as usize;
-                    let end_index =
-                        (modified_track.data_offset as u64 + modified_track.data_size) as usize;
-                    let modified_buffer = &buffer.elements[start_index..end_index];
-                    new_buffer.elements.extend_from_slice(modified_buffer);
-                    current_offset += modified_track.data_size;
-                    new_node.tracks.elements.push(new_track);
-                }
-                new_transform_group.nodes.elements.push(new_node);
-            }
-        }
-    }
-    new_groups.elements.push(new_transform_group);
-
-    // Now we need to grab the mat/vis groups from the modified anim
-    if let Anim::V20 { groups, buffer, .. } | Anim::V21 { groups, buffer, .. } = &modified_anim {
-        for modified_group in &groups.elements {
-            if modified_group.group_type == GroupType::Transform {
-                continue;
-            }
-            let mut new_group = ssbh_lib::formats::anim::Group {
-                group_type: modified_group.group_type,
-                nodes: SsbhArray::new(),
+    if !spliced_transform_nodes_data.is_empty() {
+        let mut new_transform_group = ssbh_lib::formats::anim::Group {
+            group_type: ssbh_lib::formats::anim::GroupType::Transform,
+            nodes: SsbhArray::new(),
+        };
+        for node_data in &spliced_transform_nodes_data {
+            let new_node = ssbh_lib::formats::anim::Node {
+                name: node_data.name.clone().into(),
+                tracks: SsbhArray::from_vec(vec![TrackV2 {
+                    data_offset: current_offset as u32,
+                    ..node_data.track.clone()
+                }]),
             };
-            for modified_node in &modified_group.nodes.elements {
-                let mut new_node = ssbh_lib::formats::anim::Node {
-                    name: modified_node.name.clone(),
-                    tracks: SsbhArray::new(),
-                };
-                for modified_track in &modified_node.tracks.elements {
-                    let new_track = ssbh_lib::formats::anim::TrackV2 {
-                        data_offset: current_offset as u32,
-                        ..modified_track.clone()
-                    };
-                    let start_index = modified_track.data_offset as usize;
-                    let end_index =
-                        (modified_track.data_offset as u64 + modified_track.data_size) as usize;
-                    let modified_buffer = &buffer.elements[start_index..end_index];
-                    new_buffer.elements.extend_from_slice(modified_buffer);
-                    current_offset += modified_track.data_size;
-                    new_node.tracks.elements.push(new_track);
-                }
-                new_group.nodes.elements.push(new_node);
-            }
-            new_groups.elements.push(new_group);
+
+            new_buffer.elements.extend_from_slice(&node_data.buffer);
+            current_offset += node_data.buffer.len() as u64;
+            new_transform_group.nodes.elements.push(new_node);
         }
+        new_groups.elements.push(new_transform_group);
     }
 
-    // Now account for a case where the modified anim only contains one of either the Vis or Mat group,
-    // so the reference anim may contain the other group.
-    if let Anim::V20 { groups, .. } | Anim::V21 { groups, .. } = &reference_anim {
-        for reference_group in &groups.elements {
-            if reference_group.group_type == GroupType::Transform {
-                continue;
-            }
-            if modified_group_types.contains(&reference_group.group_type) {
-                continue;
-            }
-            let mut new_group = ssbh_lib::formats::anim::Group {
-                group_type: reference_group.group_type,
-                nodes: SsbhArray::new(),
+    let spliced_vis_group_and_buf = get_anim_group_and_buffer_with_fallback(
+        modified_groups,
+        modified_buffer,
+        reference_groups,
+        reference_buffer,
+        GroupType::Visibility,
+    );
+
+    let spliced_mat_group_and_buf = get_anim_group_and_buffer_with_fallback(
+        modified_groups,
+        modified_buffer,
+        reference_groups,
+        reference_buffer,
+        GroupType::Material,
+    );
+
+    for spliced_group in vec![spliced_vis_group_and_buf, spliced_mat_group_and_buf]
+        .into_iter()
+        .flatten()
+    {
+        let mut new_group = Group {
+            group_type: spliced_group.group.group_type,
+            nodes: SsbhArray::new(),
+        };
+        for old_node in &spliced_group.group.nodes.elements {
+            let mut new_node = Node {
+                name: old_node.name.clone(),
+                tracks: SsbhArray::new(),
             };
-            for reference_node in &reference_group.nodes.elements {
-                let mut new_node = ssbh_lib::formats::anim::Node {
-                    name: reference_node.name.clone(),
-                    tracks: SsbhArray::new(),
+            for old_track in &old_node.tracks.elements {
+                let new_track = TrackV2 {
+                    data_offset: current_offset as u32,
+                    ..old_track.clone()
                 };
-                for reference_track in &reference_node.tracks.elements {
-                    let new_track = ssbh_lib::formats::anim::TrackV2 {
-                        data_offset: current_offset as u32,
-                        ..reference_track.clone()
-                    };
-                    let reference_buffer = reference_node_name_to_buffer
-                        .get(reference_node.name.to_str().unwrap())
-                        .unwrap();
-                    new_buffer.elements.extend_from_slice(reference_buffer);
-                    current_offset += reference_track.data_size;
-                    new_node.tracks.elements.push(new_track);
-                }
-                new_group.nodes.elements.push(new_node);
+                let start_index = old_track.data_offset as usize;
+                let end_index = (old_track.data_offset as u64 + old_track.data_size) as usize;
+                let old_buffer = spliced_group.buffer;
+                let slice = &old_buffer.elements[start_index..end_index];
+                new_buffer.elements.extend_from_slice(slice);
+                current_offset += slice.len() as u64;
+                new_node.tracks.elements.push(new_track);
             }
-            new_groups.elements.push(new_group);
+            new_group.nodes.elements.push(new_node);
         }
+        new_groups.elements.push(new_group);
     }
 
     match reference_anim {
